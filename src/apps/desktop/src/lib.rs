@@ -1138,7 +1138,7 @@ async fn init_agentic_system() -> anyhow::Result<(
     coordination::set_global_scheduler(scheduler.clone());
 
     let local_agent_task_tracker = Arc::new(
-        bitfun_core::service::local_agent_api::TaskResultTracker::default(),
+        bitfun_core::agentic::local_agent_api::TaskResultTracker::default(),
     );
     scheduler.attach_task_result_tracker(
         "local_agent_api",

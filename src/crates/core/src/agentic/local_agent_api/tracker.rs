@@ -19,13 +19,34 @@ struct TrackedTask {
     notify: Arc<Notify>,
 }
 
-#[derive(Debug, Default)]
+const DEFAULT_TASK_TTL: Duration = Duration::from_secs(3600); // 1 hour
+
+#[derive(Debug)]
 pub struct TaskResultTracker {
     tasks: DashMap<String, TrackedTask>,
+    default_ttl: Duration,
+}
+
+impl Default for TaskResultTracker {
+    fn default() -> Self {
+        Self {
+            tasks: DashMap::new(),
+            default_ttl: DEFAULT_TASK_TTL,
+        }
+    }
 }
 
 impl TaskResultTracker {
+    /// Create a tracker with a custom TTL for automatic cleanup.
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            tasks: DashMap::new(),
+            default_ttl: ttl,
+        }
+    }
+
     pub fn register(&self, registration: TaskRegistration) {
+        self.prune_older_than(self.default_ttl);
         self.tasks.insert(
             registration.turn_id.clone(),
             TrackedTask {
@@ -167,5 +188,54 @@ mod tests {
             .await;
 
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn register_prunes_expired_tasks() {
+        let tracker = TaskResultTracker::with_ttl(Duration::from_millis(1));
+
+        // Register first task — it will be created with a timestamp older than 1ms
+        // (practically guaranteed since the register call itself takes time)
+        tracker.register(TaskRegistration {
+            turn_id: "expired-turn".to_string(),
+            session_id: "session-1".to_string(),
+            session_name: "Worker".to_string(),
+        });
+
+        // Wait a bit to ensure the task is expired
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Register a second task — this triggers prune_older_than on the expired one
+        tracker.register(TaskRegistration {
+            turn_id: "fresh-turn".to_string(),
+            session_id: "session-1".to_string(),
+            session_name: "Worker".to_string(),
+        });
+
+        // Expired task should be gone
+        assert!(tracker.query("expired-turn").is_none());
+        // Fresh task should still exist
+        assert!(tracker.query("fresh-turn").is_some());
+    }
+
+    #[tokio::test]
+    async fn default_ttl_does_not_prune_active_tasks() {
+        let tracker = TaskResultTracker::default(); // 1-hour TTL
+
+        tracker.register(TaskRegistration {
+            turn_id: "active-turn".to_string(),
+            session_id: "session-1".to_string(),
+            session_name: "Worker".to_string(),
+        });
+
+        // Register another task — default TTL of 1h should not prune the first
+        tracker.register(TaskRegistration {
+            turn_id: "another-turn".to_string(),
+            session_id: "session-1".to_string(),
+            session_name: "Worker".to_string(),
+        });
+
+        assert!(tracker.query("active-turn").is_some());
+        assert!(tracker.query("another-turn").is_some());
     }
 }

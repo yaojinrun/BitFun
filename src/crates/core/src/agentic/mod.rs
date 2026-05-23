@@ -24,6 +24,9 @@ pub mod deep_review;
 pub mod deep_review_policy;
 pub(crate) mod subagent_runtime;
 
+// Local Agent API for desktop callers
+pub mod local_agent_api;
+
 // Shared-context fork-agent execution module
 pub mod fork_agent;
 

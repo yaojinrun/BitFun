@@ -4,7 +4,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use bitfun_core::service::local_agent_api::{
+use bitfun_core::agentic::local_agent_api::{
     LocalAgentApiError, LocalAgentApiService, LocalAgentErrorCode, TaskRunRequest,
 };
 use std::sync::Arc;
@@ -87,7 +87,7 @@ fn error_response(error: LocalAgentApiError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitfun_core::service::local_agent_api::{
+    use bitfun_core::agentic::local_agent_api::{
         LocalAgentApiError, LocalAgentErrorCode,
     };
 

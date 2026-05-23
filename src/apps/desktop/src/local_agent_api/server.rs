@@ -2,7 +2,7 @@ use super::auth::load_or_create_token;
 use super::http::{router, LocalAgentHttpState};
 use anyhow::{Context, Result};
 use bitfun_core::agentic::coordination::{ConversationCoordinator, DialogScheduler};
-use bitfun_core::service::local_agent_api::{LocalAgentApiService, TaskResultTracker};
+use bitfun_core::agentic::local_agent_api::{LocalAgentApiService, TaskResultTracker};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;

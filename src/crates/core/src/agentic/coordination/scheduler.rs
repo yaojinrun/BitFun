@@ -28,7 +28,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::service::local_agent_api::TaskResultTracker;
+use crate::agentic::local_agent_api::TaskResultTracker;
 
 const MAX_QUEUE_DEPTH: usize = 20;
 
@@ -230,8 +230,14 @@ impl DialogScheduler {
         self.task_result_trackers.insert(name.into(), tracker);
     }
 
-    fn notify_task_result_trackers(&self, session_id: &str, outcome: &TurnOutcome) {
-        for tracker in self.task_result_trackers.iter() {
+    /// Notify all attached task result trackers of a turn outcome.
+    /// `pub(crate)` for independent testing without constructing a full scheduler.
+    pub(crate) fn notify_task_result_trackers(
+        trackers: &DashMap<String, Arc<TaskResultTracker>>,
+        session_id: &str,
+        outcome: &TurnOutcome,
+    ) {
+        for tracker in trackers.iter() {
             tracker.value().record_outcome(session_id, outcome.clone());
         }
     }
@@ -727,7 +733,7 @@ Status: {status}"
     /// Background loop that receives turn outcome notifications from the coordinator.
     async fn run_outcome_handler(&self, mut outcome_rx: mpsc::Receiver<(String, TurnOutcome)>) {
         while let Some((session_id, outcome)) = outcome_rx.recv().await {
-            self.notify_task_result_trackers(&session_id, &outcome);
+            Self::notify_task_result_trackers(&self.task_result_trackers, &session_id, &outcome);
             self.round_yield_flags.clear(&session_id);
             // Only drop steering messages targeted at the *finished* turn. We
             // must NOT clear the entire session buffer here: a user might have
@@ -798,30 +804,94 @@ pub fn set_global_scheduler(scheduler: Arc<DialogScheduler>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service::local_agent_api::{TaskRegistration, TaskResultTracker, LocalAgentTaskStatus};
+    use crate::agentic::local_agent_api::{TaskRegistration, TaskResultTracker, LocalAgentTaskStatus};
 
     #[tokio::test]
-    async fn outcome_observer_receives_completed_turn() {
-        let observer = Arc::new(TaskResultTracker::default());
-        observer.register(TaskRegistration {
-            turn_id: "turn-observed".to_string(),
-            session_id: "session-observed".to_string(),
-            session_name: "Observed".to_string(),
+    async fn scheduler_notifies_attached_task_result_trackers() {
+        let trackers: DashMap<String, Arc<TaskResultTracker>> = DashMap::new();
+        let tracker = Arc::new(TaskResultTracker::default());
+        let name = "test-observer";
+
+        // Simulate scheduler.attach_task_result_tracker
+        trackers.insert(name.to_string(), tracker.clone());
+
+        // Register a task as the scheduler would
+        tracker.register(TaskRegistration {
+            turn_id: "turn-1".to_string(),
+            session_id: "session-1".to_string(),
+            session_name: "TestWorker".to_string(),
         });
 
-        observer.record_outcome(
-            "session-observed",
-            TurnOutcome::Completed {
-                turn_id: "turn-observed".to_string(),
-                final_response: "ok".to_string(),
+        let response_before = tracker.query("turn-1").expect("should exist before notify");
+        assert_eq!(response_before.status, LocalAgentTaskStatus::Running);
+
+        // Now notify through the shared pub(crate) function — this is the same
+        // code path that DialogScheduler::run_outcome_handler uses.
+        DialogScheduler::notify_task_result_trackers(
+            &trackers,
+            "session-1",
+            &TurnOutcome::Completed {
+                turn_id: "turn-1".to_string(),
+                final_response: "task completed".to_string(),
             },
         );
 
-        let response = observer
-            .query("turn-observed")
+        let response_after = tracker
+            .query("turn-1")
             .expect("observer should store outcome");
-        assert_eq!(response.status, LocalAgentTaskStatus::Completed);
-        assert_eq!(response.final_response.as_deref(), Some("ok"));
+        assert_eq!(response_after.status, LocalAgentTaskStatus::Completed);
+        assert_eq!(response_after.final_response.as_deref(), Some("task completed"));
+    }
+
+    #[tokio::test]
+    async fn notify_skips_unregistered_turn() {
+        let trackers: DashMap<String, Arc<TaskResultTracker>> = DashMap::new();
+        let tracker = Arc::new(TaskResultTracker::default());
+        trackers.insert("observer".to_string(), tracker.clone());
+
+        // No turn registered — notify should not panic
+        DialogScheduler::notify_task_result_trackers(
+            &trackers,
+            "session-1",
+            &TurnOutcome::Completed {
+                turn_id: "unknown-turn".to_string(),
+                final_response: "done".to_string(),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_observer_receives_outcomes() {
+        let trackers: DashMap<String, Arc<TaskResultTracker>> = DashMap::new();
+        let tracker_a = Arc::new(TaskResultTracker::default());
+        let tracker_b = Arc::new(TaskResultTracker::default());
+
+        trackers.insert("observer-a".to_string(), tracker_a.clone());
+        trackers.insert("observer-b".to_string(), tracker_b.clone());
+
+        // Both observers register the same turn
+        for tracker in [&tracker_a, &tracker_b] {
+            tracker.register(TaskRegistration {
+                turn_id: "turn-1".to_string(),
+                session_id: "session-1".to_string(),
+                session_name: "Worker".to_string(),
+            });
+        }
+
+        DialogScheduler::notify_task_result_trackers(
+            &trackers,
+            "session-1",
+            &TurnOutcome::Completed {
+                turn_id: "turn-1".to_string(),
+                final_response: "done".to_string(),
+            },
+        );
+
+        for (label, tracker) in [("A", &tracker_a), ("B", &tracker_b)] {
+            let response = tracker.query("turn-1").expect(label);
+            assert_eq!(response.status, LocalAgentTaskStatus::Completed, "observer-{label}");
+            assert_eq!(response.final_response.as_deref(), Some("done"), "observer-{label}");
+        }
     }
 
     fn agent_session_active_turn(source_session_id: &str) -> ActiveTurn {
