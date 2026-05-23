@@ -24,7 +24,7 @@ pub struct SendMessageRequest {
 }
 
 /// Response when sending a message to a local agent session
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SendMessageResponse {
     pub session_id: String,
     pub message_id: String,
