@@ -1,5 +1,8 @@
-mod types;
-mod tracker;
+pub mod tracker;
+pub mod types;
 
-pub use types::*;
-pub use tracker::TaskResultTracker;
+pub use tracker::{TaskRegistration, TaskResultTracker};
+pub use types::{
+    LocalAgentApiError, LocalAgentErrorCode, LocalAgentTaskStatus, SessionCandidate,
+    TaskQueryResponse, TaskRunRequest, TaskRunResponse,
+};

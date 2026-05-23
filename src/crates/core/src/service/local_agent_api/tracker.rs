@@ -1,182 +1,171 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use crate::service::local_agent_api::types::{SendMessageResponse, LocalAgentApiError};
+use super::types::{LocalAgentTaskStatus, TaskQueryResponse};
+use crate::agentic::coordination::turn_outcome::TurnOutcome;
+use dashmap::DashMap;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use tokio::sync::Notify;
 
-/// Tracks results of local agent API tasks
 #[derive(Debug, Clone)]
+pub struct TaskRegistration {
+    pub turn_id: String,
+    pub session_id: String,
+    pub session_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct TrackedTask {
+    response: TaskQueryResponse,
+    created_at: SystemTime,
+    notify: Arc<Notify>,
+}
+
+#[derive(Debug, Default)]
 pub struct TaskResultTracker {
-    /// Map of task IDs to their results
-    results: Arc<Mutex<HashMap<String, SendMessageResponse>>>,
+    tasks: DashMap<String, TrackedTask>,
 }
 
 impl TaskResultTracker {
-    /// Creates a new task result tracker
-    pub fn new() -> Self {
-        Self {
-            results: Arc::new(Mutex::new(HashMap::new())),
+    pub fn register(&self, registration: TaskRegistration) {
+        self.tasks.insert(
+            registration.turn_id.clone(),
+            TrackedTask {
+                response: TaskQueryResponse {
+                    status: LocalAgentTaskStatus::Running,
+                    session_id: Some(registration.session_id),
+                    session_name: Some(registration.session_name),
+                    turn_id: registration.turn_id,
+                    final_response: None,
+                    error: None,
+                },
+                created_at: SystemTime::now(),
+                notify: Arc::new(Notify::new()),
+            },
+        );
+    }
+
+    pub fn query(&self, turn_id: &str) -> Option<TaskQueryResponse> {
+        self.tasks.get(turn_id).map(|entry| entry.response.clone())
+    }
+
+    pub fn query_or_not_found(&self, turn_id: &str) -> TaskQueryResponse {
+        self.query(turn_id).unwrap_or_else(|| TaskQueryResponse {
+            status: LocalAgentTaskStatus::NotFound,
+            session_id: None,
+            session_name: None,
+            turn_id: turn_id.to_string(),
+            final_response: None,
+            error: None,
+        })
+    }
+
+    pub async fn wait_for(&self, turn_id: &str, timeout: Duration) -> Option<TaskQueryResponse> {
+        if let Some(existing) = self.query(turn_id) {
+            if existing.status != LocalAgentTaskStatus::Running {
+                return Some(existing);
+            }
+        }
+
+        let notify = self.tasks.get(turn_id).map(|entry| entry.notify.clone())?;
+        let notified = notify.notified();
+        tokio::select! {
+            _ = notified => self.query(turn_id),
+            _ = tokio::time::sleep(timeout) => None,
         }
     }
 
-    /// Stores a task result
-    pub fn store_result(&self, task_id: String, result: SendMessageResponse) {
-        let mut results = self.results.lock().unwrap();
-        results.insert(task_id, result);
+    pub fn record_outcome(&self, session_id: &str, outcome: TurnOutcome) {
+        let turn_id = outcome.turn_id().to_string();
+        let Some(mut entry) = self.tasks.get_mut(&turn_id) else {
+            return;
+        };
+
+        if entry.response.session_id.as_deref() != Some(session_id) {
+            return;
+        }
+
+        match outcome {
+            TurnOutcome::Completed { final_response, .. } => {
+                entry.response.status = LocalAgentTaskStatus::Completed;
+                entry.response.final_response = Some(final_response);
+                entry.response.error = None;
+            }
+            TurnOutcome::Cancelled { .. } => {
+                entry.response.status = LocalAgentTaskStatus::Cancelled;
+                entry.response.final_response = None;
+                entry.response.error = None;
+            }
+            TurnOutcome::Failed { error, .. } => {
+                entry.response.status = LocalAgentTaskStatus::Failed;
+                entry.response.final_response = None;
+                entry.response.error = Some(error);
+            }
+        }
+
+        entry.notify.notify_waiters();
     }
 
-    /// Retrieves a task result by ID
-    pub fn get_result(&self, task_id: &str) -> Result<SendMessageResponse, LocalAgentApiError> {
-        let results = self.results.lock().unwrap();
-        results.get(task_id)
-            .cloned()
-            .ok_or_else(|| LocalAgentApiError::SessionNotFound(format!("Task result not found for ID: {}", task_id)))
-    }
+    pub fn prune_older_than(&self, max_age: Duration) {
+        let now = SystemTime::now();
+        let expired: Vec<String> = self
+            .tasks
+            .iter()
+            .filter_map(|entry| {
+                now.duration_since(entry.created_at)
+                    .ok()
+                    .filter(|age| *age > max_age)
+                    .map(|_| entry.key().clone())
+            })
+            .collect();
 
-    /// Removes a task result by ID
-    pub fn remove_result(&self, task_id: &str) -> Option<SendMessageResponse> {
-        let mut results = self.results.lock().unwrap();
-        results.remove(task_id)
-    }
-
-    /// Clears all task results
-    pub fn clear(&self) {
-        let mut results = self.results.lock().unwrap();
-        results.clear();
-    }
-
-    /// Gets the number of tracked task results
-    pub fn len(&self) -> usize {
-        let results = self.results.lock().unwrap();
-        results.len()
-    }
-
-    /// Checks if no task results are being tracked
-    pub fn is_empty(&self) -> bool {
-        let results = self.results.lock().unwrap();
-        results.is_empty()
+        for turn_id in expired {
+            self.tasks.remove(&turn_id);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service::local_agent_api::types::{SendMessageResponse, LocalAgentApiError};
+    use crate::agentic::coordination::turn_outcome::TurnOutcome;
 
-    #[test]
-    fn test_tracker_new() {
-        let tracker = TaskResultTracker::new();
-        assert!(tracker.is_empty());
-        assert_eq!(tracker.len(), 0);
+    #[tokio::test]
+    async fn registered_task_is_running_until_completed() {
+        let tracker = TaskResultTracker::default();
+        tracker.register(TaskRegistration {
+            turn_id: "turn-1".to_string(),
+            session_id: "session-1".to_string(),
+            session_name: "Worker".to_string(),
+        });
+
+        let before = tracker.query("turn-1").expect("task should exist");
+        assert_eq!(before.status, LocalAgentTaskStatus::Running);
+
+        tracker.record_outcome(
+            "session-1",
+            TurnOutcome::Completed {
+                turn_id: "turn-1".to_string(),
+                final_response: "done".to_string(),
+            },
+        );
+
+        let after = tracker.query("turn-1").expect("task should exist");
+        assert_eq!(after.status, LocalAgentTaskStatus::Completed);
+        assert_eq!(after.final_response.as_deref(), Some("done"));
     }
 
-    #[test]
-    fn test_tracker_store_and_get_result() {
-        let tracker = TaskResultTracker::new();
-        let task_id = "task-123".to_string();
-        let result = SendMessageResponse {
-            session_id: "session-456".to_string(),
-            message_id: "msg-789".to_string(),
-            status: "completed".to_string(),
-        };
+    #[tokio::test]
+    async fn wait_returns_none_when_timeout_expires() {
+        let tracker = TaskResultTracker::default();
+        tracker.register(TaskRegistration {
+            turn_id: "turn-2".to_string(),
+            session_id: "session-2".to_string(),
+            session_name: "Worker".to_string(),
+        });
 
-        // Store result
-        tracker.store_result(task_id.clone(), result.clone());
+        let result = tracker
+            .wait_for("turn-2", std::time::Duration::from_millis(1))
+            .await;
 
-        // Retrieve result
-        let retrieved = tracker.get_result(&task_id).unwrap();
-        assert_eq!(retrieved, result);
-    }
-
-    #[test]
-    fn test_tracker_get_nonexistent_result() {
-        let tracker = TaskResultTracker::new();
-        let task_id = "nonexistent";
-
-        // Try to get a result that doesn't exist
-        let error = tracker.get_result(task_id).unwrap_err();
-        assert!(matches!(error, LocalAgentApiError::SessionNotFound(_)));
-    }
-
-    #[test]
-    fn test_tracker_remove_result() {
-        let tracker = TaskResultTracker::new();
-        let task_id = "task-123".to_string();
-        let result = SendMessageResponse {
-            session_id: "session-456".to_string(),
-            message_id: "msg-789".to_string(),
-            status: "completed".to_string(),
-        };
-
-        // Store result
-        tracker.store_result(task_id.clone(), result.clone());
-
-        // Remove result
-        let removed = tracker.remove_result(&task_id);
-        assert!(removed.is_some());
-        assert_eq!(removed.unwrap(), result);
-
-        // Try to get removed result
-        let error = tracker.get_result(&task_id).unwrap_err();
-        assert!(matches!(error, LocalAgentApiError::SessionNotFound(_)));
-
-        // Try to remove again (should return None)
-        let removed_again = tracker.remove_result(&task_id);
-        assert!(removed_again.is_none());
-    }
-
-    #[test]
-    fn test_tracker_clear() {
-        let tracker = TaskResultTracker::new();
-        let task_id1 = "task-123".to_string();
-        let task_id2 = "task-456".to_string();
-        let result1 = SendMessageResponse {
-            session_id: "session-456".to_string(),
-            message_id: "msg-789".to_string(),
-            status: "completed".to_string(),
-        };
-        let result2 = SendMessageResponse {
-            session_id: "session-789".to_string(),
-            message_id: "msg-012".to_string(),
-            status: "failed".to_string(),
-        };
-
-        // Store two results
-        tracker.store_result(task_id1.clone(), result1.clone());
-        tracker.store_result(task_id2.clone(), result2.clone());
-
-        assert_eq!(tracker.len(), 2);
-        assert!(!tracker.is_empty());
-
-        // Clear tracker
-        tracker.clear();
-
-        assert_eq!(tracker.len(), 0);
-        assert!(tracker.is_empty());
-
-        // Verify results are gone
-        let error1 = tracker.get_result(&task_id1).unwrap_err();
-        let error2 = tracker.get_result(&task_id2).unwrap_err();
-        assert!(matches!(error1, LocalAgentApiError::SessionNotFound(_)));
-        assert!(matches!(error2, LocalAgentApiError::SessionNotFound(_)));
-    }
-
-    #[test]
-    fn test_tracker_clone() {
-        let tracker1 = TaskResultTracker::new();
-        let task_id = "task-123".to_string();
-        let result = SendMessageResponse {
-            session_id: "session-456".to_string(),
-            message_id: "msg-789".to_string(),
-            status: "completed".to_string(),
-        };
-
-        // Store result in original tracker
-        tracker1.store_result(task_id.clone(), result.clone());
-
-        // Clone tracker
-        let tracker2 = tracker1.clone();
-
-        // Both should have the result
-        assert_eq!(tracker1.get_result(&task_id).unwrap(), result);
-        assert_eq!(tracker2.get_result(&task_id).unwrap(), result);
+        assert!(result.is_none());
     }
 }

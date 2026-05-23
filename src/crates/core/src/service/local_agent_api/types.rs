@@ -1,72 +1,135 @@
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use serde_json::{Map, Value};
 
-/// Request to start a local agent session
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StartSessionRequest {
-    pub agent_id: String,
-    pub config: Option<serde_json::Value>,
-}
-
-/// Response when starting a local agent session
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StartSessionResponse {
-    pub session_id: String,
-    pub status: String,
-}
-
-/// Request to send a message to a local agent session
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SendMessageRequest {
-    pub session_id: String,
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRunRequest {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub session_name: Option<String>,
+    pub workspace_path: String,
     pub message: String,
-    pub metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    pub agent_type: Option<String>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
-/// Response when sending a message to a local agent session
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SendMessageResponse {
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalAgentTaskStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    NotFound,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCandidate {
     pub session_id: String,
-    pub message_id: String,
-    pub status: String,
+    pub session_name: String,
+    pub agent_type: String,
+    pub created_at: u64,
 }
 
-/// Request to stop a local agent session
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StopSessionRequest {
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRunResponse {
+    pub status: LocalAgentTaskStatus,
     pub session_id: String,
+    pub session_name: String,
+    pub turn_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_response: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub timed_out: bool,
 }
 
-/// Response when stopping a local agent session
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StopSessionResponse {
-    pub session_id: String,
-    pub status: String,
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskQueryResponse {
+    pub status: LocalAgentTaskStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    pub turn_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_response: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
-/// Error types for the local agent API
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum LocalAgentApiError {
-    InvalidRequest(String),
-    SessionNotFound(String),
-    AgentNotFound(String),
-    InternalError(String),
-    Timeout,
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum LocalAgentErrorCode {
+    Unauthorized,
+    InvalidRequest,
+    SessionNotFound,
+    SessionNameAmbiguous,
+    SessionMismatch,
+    SubmitFailed,
+    TaskNotFound,
+    InternalError,
 }
 
-impl fmt::Display for LocalAgentApiError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl LocalAgentErrorCode {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            LocalAgentApiError::InvalidRequest(msg) => write!(f, "Invalid request: {}", msg),
-            LocalAgentApiError::SessionNotFound(msg) => write!(f, "Session not found: {}", msg),
-            LocalAgentApiError::AgentNotFound(msg) => write!(f, "Agent not found: {}", msg),
-            LocalAgentApiError::InternalError(msg) => write!(f, "Internal error: {}", msg),
-            LocalAgentApiError::Timeout => write!(f, "Request timeout"),
+            Self::Unauthorized => "UNAUTHORIZED",
+            Self::InvalidRequest => "INVALID_REQUEST",
+            Self::SessionNotFound => "SESSION_NOT_FOUND",
+            Self::SessionNameAmbiguous => "SESSION_NAME_AMBIGUOUS",
+            Self::SessionMismatch => "SESSION_MISMATCH",
+            Self::SubmitFailed => "SUBMIT_FAILED",
+            Self::TaskNotFound => "TASK_NOT_FOUND",
+            Self::InternalError => "INTERNAL_ERROR",
         }
     }
 }
 
-impl std::error::Error for LocalAgentApiError {}
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalAgentApiError {
+    pub code: LocalAgentErrorCode,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub details: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalAgentErrorResponse {
+    pub error: LocalAgentApiError,
+}
+
+impl LocalAgentApiError {
+    pub fn new(code: LocalAgentErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            details: Map::new(),
+        }
+    }
+
+    pub fn invalid_request(message: impl Into<String>) -> Self {
+        Self::new(LocalAgentErrorCode::InvalidRequest, message)
+    }
+
+    pub fn with_detail(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.details.insert(key.into(), value);
+        self
+    }
+
+    pub fn to_error_response(&self) -> LocalAgentErrorResponse {
+        LocalAgentErrorResponse {
+            error: self.clone(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -74,94 +137,28 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_start_session_request_serialization() {
-        let request = StartSessionRequest {
-            agent_id: "test-agent".to_string(),
-            config: Some(json!({"key": "value"})),
-        };
-        let serialized = serde_json::to_string(&request).unwrap();
-        let deserialized: StartSessionRequest = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(deserialized.agent_id, "test-agent");
-        assert_eq!(deserialized.config, Some(json!({"key": "value"})));
+    fn task_run_request_accepts_session_id_payload() {
+        let request: TaskRunRequest = serde_json::from_value(json!({
+            "sessionId": "session-1",
+            "workspacePath": "D:\\BitFun",
+            "message": "Run tests",
+            "timeoutMs": 1000
+        }))
+        .expect("request should deserialize");
+
+        assert_eq!(request.session_id.as_deref(), Some("session-1"));
+        assert_eq!(request.session_name, None);
+        assert_eq!(request.workspace_path, "D:\\BitFun");
+        assert_eq!(request.message, "Run tests");
+        assert_eq!(request.timeout_ms, Some(1000));
     }
 
     #[test]
-    fn test_start_session_response_serialization() {
-        let response = StartSessionResponse {
-            session_id: "session-123".to_string(),
-            status: "started".to_string(),
-        };
-        let serialized = serde_json::to_string(&response).unwrap();
-        let deserialized: StartSessionResponse = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(deserialized.session_id, "session-123");
-        assert_eq!(deserialized.status, "started");
-    }
+    fn api_error_serializes_stable_code_and_message() {
+        let error = LocalAgentApiError::invalid_request("message is required");
+        let value = serde_json::to_value(error.to_error_response()).expect("serialize error");
 
-    #[test]
-    fn test_send_message_request_serialization() {
-        let request = SendMessageRequest {
-            session_id: "session-123".to_string(),
-            message: "Hello, agent!".to_string(),
-            metadata: Some(json!({"priority": "high"})),
-        };
-        let serialized = serde_json::to_string(&request).unwrap();
-        let deserialized: SendMessageRequest = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(deserialized.session_id, "session-123");
-        assert_eq!(deserialized.message, "Hello, agent!");
-        assert_eq!(deserialized.metadata, Some(json!({"priority": "high"})));
-    }
-
-    #[test]
-    fn test_send_message_response_serialization() {
-        let response = SendMessageResponse {
-            session_id: "session-123".to_string(),
-            message_id: "msg-456".to_string(),
-            status: "sent".to_string(),
-        };
-        let serialized = serde_json::to_string(&response).unwrap();
-        let deserialized: SendMessageResponse = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(deserialized.session_id, "session-123");
-        assert_eq!(deserialized.message_id, "msg-456");
-        assert_eq!(deserialized.status, "sent");
-    }
-
-    #[test]
-    fn test_stop_session_request_serialization() {
-        let request = StopSessionRequest {
-            session_id: "session-123".to_string(),
-        };
-        let serialized = serde_json::to_string(&request).unwrap();
-        let deserialized: StopSessionRequest = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(deserialized.session_id, "session-123");
-    }
-
-    #[test]
-    fn test_stop_session_response_serialization() {
-        let response = StopSessionResponse {
-            session_id: "session-123".to_string(),
-            status: "stopped".to_string(),
-        };
-        let serialized = serde_json::to_string(&response).unwrap();
-        let deserialized: StopSessionResponse = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(deserialized.session_id, "session-123");
-        assert_eq!(deserialized.status, "stopped");
-    }
-
-    #[test]
-    fn test_local_agent_api_error_display() {
-        let error = LocalAgentApiError::InvalidRequest("test error".to_string());
-        assert_eq!(error.to_string(), "Invalid request: test error");
-        
-        let error = LocalAgentApiError::SessionNotFound("session not found".to_string());
-        assert_eq!(error.to_string(), "Session not found: session not found");
-        
-        let error = LocalAgentApiError::AgentNotFound("agent not found".to_string());
-        assert_eq!(error.to_string(), "Agent not found: agent not found");
-        
-        let error = LocalAgentApiError::InternalError("internal error".to_string());
-        assert_eq!(error.to_string(), "Internal error: internal error");
-        
-        let error = LocalAgentApiError::Timeout;
-        assert_eq!(error.to_string(), "Request timeout");
+        assert_eq!(value["error"]["code"], "INVALID_REQUEST");
+        assert_eq!(value["error"]["message"], "message is required");
     }
 }
