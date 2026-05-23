@@ -28,6 +28,8 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::service::local_agent_api::TaskResultTracker;
+
 const MAX_QUEUE_DEPTH: usize = 20;
 
 /// Result of [`DialogScheduler::submit`]: whether this message began executing immediately
@@ -166,6 +168,8 @@ pub struct DialogScheduler {
     /// Per-session FIFO buffer of user "steering" messages drained at round boundaries
     /// by the engine and injected into the running dialog turn.
     steering_buffer: Arc<SessionSteeringBuffer>,
+    /// Named set of TaskResultTracker observers notified when any turn completes.
+    task_result_trackers: Arc<DashMap<String, Arc<TaskResultTracker>>>,
 }
 
 /// Outcome of [`DialogScheduler::submit_steering`].
@@ -201,6 +205,7 @@ impl DialogScheduler {
             outcome_tx,
             round_yield_flags: Arc::new(SessionRoundYieldFlags::default()),
             steering_buffer: Arc::new(SessionSteeringBuffer::default()),
+            task_result_trackers: Arc::new(DashMap::new()),
         });
 
         let scheduler_for_handler = Arc::clone(&scheduler);
@@ -214,6 +219,21 @@ impl DialogScheduler {
     /// Returns a sender to give to ConversationCoordinator for turn outcome notifications.
     pub fn outcome_sender(&self) -> mpsc::Sender<(String, TurnOutcome)> {
         self.outcome_tx.clone()
+    }
+
+    /// Register a TaskResultTracker observer to be notified when any turn completes.
+    pub fn attach_task_result_tracker(
+        &self,
+        name: impl Into<String>,
+        tracker: Arc<TaskResultTracker>,
+    ) {
+        self.task_result_trackers.insert(name.into(), tracker);
+    }
+
+    fn notify_task_result_trackers(&self, session_id: &str, outcome: &TurnOutcome) {
+        for tracker in self.task_result_trackers.iter() {
+            tracker.value().record_outcome(session_id, outcome.clone());
+        }
     }
 
     /// Pass to [`ConversationCoordinator::set_round_preempt_source`](super::coordinator::ConversationCoordinator::set_round_preempt_source).
@@ -707,6 +727,7 @@ Status: {status}"
     /// Background loop that receives turn outcome notifications from the coordinator.
     async fn run_outcome_handler(&self, mut outcome_rx: mpsc::Receiver<(String, TurnOutcome)>) {
         while let Some((session_id, outcome)) = outcome_rx.recv().await {
+            self.notify_task_result_trackers(&session_id, &outcome);
             self.round_yield_flags.clear(&session_id);
             // Only drop steering messages targeted at the *finished* turn. We
             // must NOT clear the entire session buffer here: a user might have
@@ -777,6 +798,31 @@ pub fn set_global_scheduler(scheduler: Arc<DialogScheduler>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::local_agent_api::{TaskRegistration, TaskResultTracker, LocalAgentTaskStatus};
+
+    #[tokio::test]
+    async fn outcome_observer_receives_completed_turn() {
+        let observer = Arc::new(TaskResultTracker::default());
+        observer.register(TaskRegistration {
+            turn_id: "turn-observed".to_string(),
+            session_id: "session-observed".to_string(),
+            session_name: "Observed".to_string(),
+        });
+
+        observer.record_outcome(
+            "session-observed",
+            TurnOutcome::Completed {
+                turn_id: "turn-observed".to_string(),
+                final_response: "ok".to_string(),
+            },
+        );
+
+        let response = observer
+            .query("turn-observed")
+            .expect("observer should store outcome");
+        assert_eq!(response.status, LocalAgentTaskStatus::Completed);
+        assert_eq!(response.final_response.as_deref(), Some("ok"));
+    }
 
     fn agent_session_active_turn(source_session_id: &str) -> ActiveTurn {
         ActiveTurn {
