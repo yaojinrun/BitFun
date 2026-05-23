@@ -1137,6 +1137,27 @@ async fn init_agentic_system() -> anyhow::Result<(
     coordinator.set_round_steering_source(scheduler.steering_monitor());
     coordination::set_global_scheduler(scheduler.clone());
 
+    let local_agent_task_tracker = Arc::new(
+        bitfun_core::service::local_agent_api::TaskResultTracker::default(),
+    );
+    scheduler.attach_task_result_tracker(
+        "local_agent_api",
+        local_agent_task_tracker.clone(),
+    );
+    let local_agent_config_path = path_manager
+        .user_data_dir()
+        .join("local-agent-api.json");
+    if let Err(error) = crate::local_agent_api::server::start_local_agent_api_server(
+        local_agent_config_path,
+        coordinator.clone(),
+        scheduler.clone(),
+        local_agent_task_tracker,
+    )
+    .await
+    {
+        log::error!("Failed to start Local Agent API server: {}", error);
+    }
+
     let cron_service =
         bitfun_core::service::cron::CronService::new(path_manager.clone(), scheduler.clone())
             .await
