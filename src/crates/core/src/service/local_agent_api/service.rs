@@ -233,6 +233,22 @@ fn task_run_response_from_query(query: TaskQueryResponse, include_timeout: bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agentic::core::{SessionKind, SessionState, SessionSummary};
+    use std::time::SystemTime;
+
+    fn summary(id: &str, name: &str, agent_type: &str) -> SessionSummary {
+        SessionSummary {
+            session_id: id.to_string(),
+            session_name: name.to_string(),
+            agent_type: agent_type.to_string(),
+            created_by: None,
+            kind: SessionKind::Standard,
+            turn_count: 0,
+            created_at: SystemTime::UNIX_EPOCH,
+            last_activity_at: SystemTime::UNIX_EPOCH,
+            state: SessionState::Idle,
+        }
+    }
 
     fn request(session_id: Option<&str>, session_name: Option<&str>) -> TaskRunRequest {
         TaskRunRequest {
@@ -266,5 +282,38 @@ mod tests {
     #[test]
     fn validate_accepts_session_name_request() {
         validate_task_request(&request(None, Some("Worker"))).expect("valid request");
+    }
+
+    #[test]
+    fn resolve_by_session_name_rejects_ambiguous_names() {
+        let sessions = vec![
+            summary("s1", "Worker", "agentic"),
+            summary("s2", "Worker", "Plan"),
+        ];
+        let req = request(None, Some("Worker"));
+
+        let error = resolve_session_from_summaries(&sessions, &req).expect_err("must fail");
+        assert_eq!(error.code, LocalAgentErrorCode::SessionNameAmbiguous);
+        assert!(error.details.contains_key("candidates"));
+    }
+
+    #[test]
+    fn resolve_by_session_id_and_name_requires_same_session() {
+        let sessions = vec![summary("s1", "Worker", "agentic")];
+        let req = request(Some("s1"), Some("Other"));
+
+        let error = resolve_session_from_summaries(&sessions, &req).expect_err("must fail");
+        assert_eq!(error.code, LocalAgentErrorCode::SessionMismatch);
+    }
+
+    #[test]
+    fn resolve_by_unique_session_name_returns_session() {
+        let sessions = vec![summary("s1", "Worker", "agentic")];
+        let req = request(None, Some("Worker"));
+
+        let resolved = resolve_session_from_summaries(&sessions, &req).expect("must resolve");
+        assert_eq!(resolved.session_id, "s1");
+        assert_eq!(resolved.session_name, "Worker");
+        assert_eq!(resolved.agent_type, "agentic");
     }
 }
