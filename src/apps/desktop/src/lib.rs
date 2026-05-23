@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod computer_use;
+mod local_agent_api;
 pub mod logging;
 pub mod macos_menubar;
 pub mod theme;
